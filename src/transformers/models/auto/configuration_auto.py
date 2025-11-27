@@ -595,6 +595,7 @@ MODEL_NAMES_MAPPING = OrderedDict[str, str](
         ("flaubert", "FlauBERT"),
         ("flava", "FLAVA"),
         ("flex_olmo", "FlexOlmo"),
+        ("flex_olmo_noqknorm_prenorm", "FlexOlmoNoQKNormPrenormConfig"),
         ("florence2", "Florence2"),
         ("fnet", "FNet"),
         ("focalnet", "FocalNet"),

@@ -171,3 +171,5 @@ tags
 
 # modular conversion
 *.modular_backup
+
+venv
