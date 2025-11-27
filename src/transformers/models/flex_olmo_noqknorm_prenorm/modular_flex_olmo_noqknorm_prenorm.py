@@ -47,6 +47,8 @@ class FlexOlmoNoQKNormPrenormConfig(FlexOlmoConfig):
         "layers.*.mlp.down_proj": "rowwise",
     }
 
+class FlexOlmoNoQKNormPrenormRMSNorm(FlexOlmoRMSNorm):
+    pass
 
 class FlexOlmoNoQKNormPrenormAttention(FlexOlmoAttention):
     def __init__(self, config: FlexOlmoNoQKNormPrenormConfig, layer_idx: Optional[int] = None):
@@ -104,10 +106,6 @@ class FlexOlmoNoQKNormPrenormAttention(FlexOlmoAttention):
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
-
-
-def FlexOlmoNoQKNormPrenormRMSNorm(FlexOlmoRMSNorm):
-    pass
 
 
 class FlexOlmoNoQKNormPrenormDecoderLayer(FlexOlmoDecoderLayer):
