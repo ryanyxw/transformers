@@ -151,14 +151,11 @@ class FlexOlmoNoQKNormPrenormDecoderLayer(FlexOlmoDecoderLayer):
         hidden_states = residual + hidden_states
         return hidden_states
 
-
-class FlexOlmoNoQKNormPrenormModel(FlexOlmoModel):
-    pass
-
-
 class FlexOlmoNoQKNormPrenormPreTrainedModel(FlexOlmoPreTrainedModel):
     config_class = FlexOlmoNoQKNormPrenormConfig
 
+class FlexOlmoNoQKNormPrenormModel(FlexOlmoModel):
+    pass
 
 class FlexOlmoNoQKNormPrenormForCausalLM(FlexOlmoForCausalLM):
     pass

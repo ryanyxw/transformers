@@ -327,6 +327,26 @@ class FlexOlmoNoQKNormPrenormDecoderLayer(GradientCheckpointingLayer):
         return hidden_states
 
 
+@auto_docstring
+class FlexOlmoNoQKNormPrenormPreTrainedModel(PreTrainedModel):
+    config: FlexOlmoNoQKNormPrenormConfig
+    base_model_prefix = "model"
+    supports_gradient_checkpointing = True
+    _no_split_modules = ["FlexOlmoNoQKNormPrenormDecoderLayer"]
+    _skip_keys_device_placement = ["past_key_values"]
+    _supports_flash_attn = True
+    _supports_sdpa = True
+    _supports_flex_attn = True
+    _can_compile_fullgraph = False  # MoE models don't work with torch.compile (`torch.where(condition)` not supported)
+    _supports_attention_backend = True
+    _can_record_outputs = {
+        "router_logits": OutputRecorder(FlexOlmoNoQKNormPrenormSparseMoeBlock, index=1),
+        "hidden_states": FlexOlmoNoQKNormPrenormDecoderLayer,
+        "attentions": FlexOlmoNoQKNormPrenormAttention,
+    }
+    config_class = FlexOlmoNoQKNormPrenormConfig
+
+
 class FlexOlmoNoQKNormPrenormRotaryEmbedding(nn.Module):
     inv_freq: torch.Tensor  # fix linting for `register_buffer`
 
@@ -442,26 +462,6 @@ class FlexOlmoNoQKNormPrenormModel(FlexOlmoNoQKNormPrenormPreTrainedModel):
             last_hidden_state=hidden_states,
             past_key_values=past_key_values,
         )
-
-
-@auto_docstring
-class FlexOlmoNoQKNormPrenormPreTrainedModel(PreTrainedModel):
-    config: FlexOlmoNoQKNormPrenormConfig
-    base_model_prefix = "model"
-    supports_gradient_checkpointing = True
-    _no_split_modules = ["FlexOlmoNoQKNormPrenormDecoderLayer"]
-    _skip_keys_device_placement = ["past_key_values"]
-    _supports_flash_attn = True
-    _supports_sdpa = True
-    _supports_flex_attn = True
-    _can_compile_fullgraph = False  # MoE models don't work with torch.compile (`torch.where(condition)` not supported)
-    _supports_attention_backend = True
-    _can_record_outputs = {
-        "router_logits": OutputRecorder(FlexOlmoNoQKNormPrenormSparseMoeBlock, index=1),
-        "hidden_states": FlexOlmoNoQKNormPrenormDecoderLayer,
-        "attentions": FlexOlmoNoQKNormPrenormAttention,
-    }
-    config_class = FlexOlmoNoQKNormPrenormConfig
 
 
 def load_balancing_loss_func(
