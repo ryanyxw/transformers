@@ -28,6 +28,7 @@ from ..flex_olmo.modeling_flex_olmo import (
     FlexOlmoForCausalLM,
     FlexOlmoModel,
     FlexOlmoPreTrainedModel,
+    FlexOlmoRMSNorm,
     apply_rotary_pos_emb,
     eager_attention_forward,
 )
