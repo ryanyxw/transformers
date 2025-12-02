@@ -13,14 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Callable, Optional
+from typing import Optional
 
 import torch
 
 from ...cache_utils import Cache
-from ...modeling_utils import ALL_ATTENTION_FUNCTIONS
-from ...processing_utils import Unpack
-from ...utils import TransformersKwargs
 from ..flex_olmo.configuration_flex_olmo import FlexOlmoConfig
 from ..flex_olmo.modeling_flex_olmo import (
     FlexOlmoAttention,
@@ -29,16 +26,16 @@ from ..flex_olmo.modeling_flex_olmo import (
     FlexOlmoModel,
     FlexOlmoPreTrainedModel,
     FlexOlmoRMSNorm,
-    apply_rotary_pos_emb,
-    eager_attention_forward,
 )
 
 
 class FlexOlmoPrenormConfig(FlexOlmoConfig):
     model_type = "flex_olmo_prenorm"
 
+
 class FlexOlmoPrenormRMSNorm(FlexOlmoRMSNorm):
     pass
+
 
 class FlexOlmoPrenormAttention(FlexOlmoAttention):
     pass
@@ -86,11 +83,14 @@ class FlexOlmoPrenormDecoderLayer(FlexOlmoDecoderLayer):
         hidden_states = residual + hidden_states
         return hidden_states
 
+
 class FlexOlmoPrenormPreTrainedModel(FlexOlmoPreTrainedModel):
     config_class = FlexOlmoPrenormConfig
 
+
 class FlexOlmoPrenormModel(FlexOlmoModel):
     pass
+
 
 class FlexOlmoPrenormForCausalLM(FlexOlmoForCausalLM):
     pass

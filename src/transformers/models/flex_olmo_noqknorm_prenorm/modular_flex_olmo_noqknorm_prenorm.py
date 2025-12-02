@@ -47,8 +47,10 @@ class FlexOlmoNoQKNormPrenormConfig(FlexOlmoConfig):
         "layers.*.mlp.down_proj": "rowwise",
     }
 
+
 class FlexOlmoNoQKNormPrenormRMSNorm(FlexOlmoRMSNorm):
     pass
+
 
 class FlexOlmoNoQKNormPrenormAttention(FlexOlmoAttention):
     def __init__(self, config: FlexOlmoNoQKNormPrenormConfig, layer_idx: Optional[int] = None):
@@ -150,11 +152,14 @@ class FlexOlmoNoQKNormPrenormDecoderLayer(FlexOlmoDecoderLayer):
         hidden_states = residual + hidden_states
         return hidden_states
 
+
 class FlexOlmoNoQKNormPrenormPreTrainedModel(FlexOlmoPreTrainedModel):
     config_class = FlexOlmoNoQKNormPrenormConfig
 
+
 class FlexOlmoNoQKNormPrenormModel(FlexOlmoModel):
     pass
+
 
 class FlexOlmoNoQKNormPrenormForCausalLM(FlexOlmoForCausalLM):
     pass
