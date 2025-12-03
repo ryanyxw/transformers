@@ -125,6 +125,8 @@ class Olmo2NoQKNormPrenormDecoderLayer(Olmo2DecoderLayer):
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
         residual = hidden_states
+        # apply norm before attention
+        hidden_states = self.pre_attention_layernorm(hidden_states)
         hidden_states, _ = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -135,7 +137,6 @@ class Olmo2NoQKNormPrenormDecoderLayer(Olmo2DecoderLayer):
             position_embeddings=position_embeddings,
             **kwargs,
         )
-        hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = residual + hidden_states
 
         # Fully Connected

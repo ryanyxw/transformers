@@ -124,7 +124,7 @@ def rotate_half(x):
 class Olmo2NoQKNormPrenormAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: Olmo2NoQKNormPrenormConfig, layer_idx: Optional[int] = None):
+    def __init__(selfself, config: Olmo2NoQKNormPrenormConfig, layer_idx: Optional[int] = None):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -236,6 +236,8 @@ class Olmo2NoQKNormPrenormDecoderLayer(GradientCheckpointingLayer):
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
         residual = hidden_states
+        # apply norm before attention
+        hidden_states = self.pre_attention_layernorm(hidden_states)
         hidden_states, _ = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -246,7 +248,6 @@ class Olmo2NoQKNormPrenormDecoderLayer(GradientCheckpointingLayer):
             position_embeddings=position_embeddings,
             **kwargs,
         )
-        hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = residual + hidden_states
 
         # Fully Connected
