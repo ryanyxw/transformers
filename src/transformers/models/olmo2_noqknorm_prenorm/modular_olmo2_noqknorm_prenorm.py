@@ -50,7 +50,7 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 class Olmo2NoQKNormPrenormAttention(Olmo2Attention):
-    def __init__(selfself, config: Olmo2NoQKNormPrenormConfig, layer_idx: Optional[int] = None):
+    def __init__(self, config: Olmo2NoQKNormPrenormConfig, layer_idx: Optional[int] = None):
         super().__init__(config=config, layer_idx=layer_idx)
         # we remove qk norm
         del self.q_norm
