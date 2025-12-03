@@ -149,7 +149,7 @@ class Olmo2NoQKNormPrenormDecoderLayer(Olmo2DecoderLayer):
         return hidden_states
 
 
-class Olmo2NoQKNormPrenormPreTrainedModel(Olmo2PretrainedModel):
+class Olmo2NoQKNormPrenormPreTrainedModel(Olmo2PreTrainedModel):
     pass
 
 

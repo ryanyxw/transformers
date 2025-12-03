@@ -19,7 +19,7 @@ from ...masking_utils import create_causal_mask
 from ...modeling_layers import GradientCheckpointingLayer
 from ...modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
-from ...modeling_utils import ALL_ATTENTION_FUNCTIONS
+from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from ...processing_utils import Unpack
 from ...utils import auto_docstring, can_return_tuple
 from ...utils.deprecation import deprecate_kwarg
@@ -260,8 +260,23 @@ class Olmo2NoQKNormPrenormDecoderLayer(GradientCheckpointingLayer):
         return hidden_states
 
 
-class Olmo2NoQKNormPrenormPreTrainedModel(Olmo2PretrainedModel):
-    pass
+@auto_docstring
+class Olmo2NoQKNormPrenormPreTrainedModel(PreTrainedModel):
+    config: Olmo2NoQKNormPrenormConfig
+    base_model_prefix = "model"
+    supports_gradient_checkpointing = True
+    _no_split_modules = ["Olmo2NoQKNormPrenormDecoderLayer"]
+    _skip_keys_device_placement = ["past_key_values"]
+    _supports_flash_attn = True
+    _supports_sdpa = True
+    _supports_flex_attn = True
+
+    _can_compile_fullgraph = True
+    _supports_attention_backend = True
+    _can_record_outputs = {
+        "hidden_states": Olmo2NoQKNormPrenormDecoderLayer,
+        "attentions": Olmo2NoQKNormPrenormAttention,
+    }
 
 
 class Olmo2NoQKNormPrenormRotaryEmbedding(nn.Module):
