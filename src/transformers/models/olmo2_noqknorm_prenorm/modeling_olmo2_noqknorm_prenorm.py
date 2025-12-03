@@ -255,7 +255,7 @@ class Olmo2NoQKNormPrenormDecoderLayer(GradientCheckpointingLayer):
 
         # apply norm before feedforward
         hidden_states = self.pre_feedforward_layernorm(hidden_states)
-        hidden_states, _ = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states)
 
         hidden_states = residual + hidden_states
         return hidden_states
