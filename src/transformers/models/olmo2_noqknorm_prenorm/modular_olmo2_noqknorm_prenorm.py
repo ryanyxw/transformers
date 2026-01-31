@@ -1,7 +1,6 @@
 from typing import Callable, Optional
 
 import torch
-import torch.nn as nn
 
 from transformers.utils.generic import TransformersKwargs
 
@@ -9,8 +8,7 @@ from ...cache_utils import Cache
 from ...modeling_utils import ALL_ATTENTION_FUNCTIONS
 from ...processing_utils import Unpack
 from ...utils import logging
-from ...utils.deprecation import deprecate_kwarg
-from ..llama.modeling_llama import LlamaPreTrainedModel, LlamaRMSNorm, eager_attention_forward
+from ..llama.modeling_llama import eager_attention_forward
 from ..olmo2.configuration_olmo2 import Olmo2Config
 from ..olmo2.modeling_olmo2 import (
     Olmo2Attention,
@@ -27,7 +25,6 @@ logger = logging.get_logger(__name__)
 
 
 class Olmo2NoQKNormPrenormConfig(Olmo2Config):
-
     model_type = "olmo2_noqknorm_prenorm"
     base_model_tp_plan = {
         "layers.*.self_attn.q_proj": "colwise",  # No longer need rep
@@ -39,6 +36,7 @@ class Olmo2NoQKNormPrenormConfig(Olmo2Config):
         "layers.*.mlp.down_proj": "rowwise",
     }
 
+
 class Olmo2NoQKNormPrenormRMSNorm(Olmo2RMSNorm):
     pass
 
@@ -48,6 +46,7 @@ def rotate_half(x):
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
+
 
 class Olmo2NoQKNormPrenormAttention(Olmo2Attention):
     def __init__(self, config: Olmo2NoQKNormPrenormConfig, layer_idx: Optional[int] = None):
@@ -68,7 +67,7 @@ class Olmo2NoQKNormPrenormAttention(Olmo2Attention):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
-        query_states =self.q_proj(hidden_states)
+        query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
@@ -163,6 +162,7 @@ class Olmo2NoQKNormPrenormModel(Olmo2Model):
 # The heads now only need to redefine the model inside to the correct `RobertaModel`
 class Olmo2NoQKNormPrenormForCausalLM(Olmo2ForCausalLM):
     pass
+
 
 __all__ = [
     "Olmo2NoQKNormPrenormConfig",

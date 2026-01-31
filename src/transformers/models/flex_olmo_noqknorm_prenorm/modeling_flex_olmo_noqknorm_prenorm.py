@@ -19,6 +19,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import dataclass
 from typing import Callable, Optional, Union
 
 import torch
@@ -31,11 +32,11 @@ from ...generation import GenerationMixin
 from ...integrations import use_kernel_forward_from_hub
 from ...masking_utils import create_causal_mask
 from ...modeling_layers import GradientCheckpointingLayer
-from ...modeling_outputs import MoeCausalLMOutputWithPast, MoeModelOutputWithPast
+from ...modeling_outputs import MoeModelOutputWithPast
 from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from ...processing_utils import Unpack
-from ...utils import TransformersKwargs, auto_docstring
+from ...utils import ModelOutput, TransformersKwargs, auto_docstring
 from ...utils.deprecation import deprecate_kwarg
 from ...utils.generic import OutputRecorder, check_model_inputs
 from .configuration_flex_olmo_noqknorm_prenorm import FlexOlmoNoQKNormPrenormConfig
@@ -482,11 +483,66 @@ class FlexOlmoNoQKNormPrenormModel(FlexOlmoNoQKNormPrenormPreTrainedModel):
         )
 
 
-def load_balancing_loss_func(
+@dataclass
+class MoeCausalLMOutputWithPast(ModelOutput):
+    """
+    Base class for causal language model (or autoregressive) with mixture of experts outputs.
+
+    Args:
+        loss (`torch.FloatTensor` of shape `(1,)`, *optional*, returned when `labels` is provided):
+            Language modeling loss (for next-token prediction).
+
+        logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, config.vocab_size)`):
+            Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
+
+        aux_loss (`torch.FloatTensor`, *optional*, returned when `labels` is provided):
+            aux_loss for the sparse modules.
+
+        router_logits (`tuple(torch.FloatTensor)`, *optional*, returned when `output_router_probs=True` and `config.add_router_probs=True` is passed or when `config.output_router_probs=True`):
+            Tuple of `torch.FloatTensor` (one for each layer) of shape `(batch_size, sequence_length, num_experts)`.
+
+            Raw router logtis (post-softmax) that are computed by MoE routers, these terms are used to compute the auxiliary
+            loss for Mixture of Experts models.
+
+        past_key_values (`Cache`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
+            It is a [`~cache_utils.Cache`] instance. For more details, see our [kv cache guide](https://huggingface.co/docs/transformers/en/kv_cache).
+
+            Contains pre-computed hidden-states (key and values in the self-attention blocks) that can be used (see
+            `past_key_values` input) to speed up sequential decoding.
+        hidden_states (`tuple(torch.FloatTensor)`, *optional*, returned when `output_hidden_states=True` is passed or when `config.output_hidden_states=True`):
+            Tuple of `torch.FloatTensor` (one for the output of the embeddings, if the model has an embedding layer, +
+            one for the output of each layer) of shape `(batch_size, sequence_length, hidden_size)`.
+
+            Hidden-states of the model at the output of each layer plus the optional initial embedding outputs.
+        attentions (`tuple(torch.FloatTensor)`, *optional*, returned when `output_attentions=True` is passed or when `config.output_attentions=True`):
+            Tuple of `torch.FloatTensor` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+            sequence_length)`.
+
+            Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
+            heads.
+    """
+
+    loss: Optional[torch.FloatTensor] = None
+    aux_loss: Optional[torch.FloatTensor] = None
+    lb_loss: Optional[torch.FloatTensor] = None
+    ce_loss: Optional[torch.FloatTensor] = None
+    logits: Optional[torch.FloatTensor] = None
+    past_key_values: Optional[Cache] = None
+    hidden_states: Optional[tuple[torch.FloatTensor, ...]] = None
+    attentions: Optional[tuple[torch.FloatTensor, ...]] = None
+    router_logits: Optional[tuple[torch.FloatTensor]] = None
+
+
+def load_balancing_loss_func_olmoe(
     gate_logits: Union[torch.Tensor, tuple[torch.Tensor], None],
     num_experts: Optional[int] = None,
     top_k=2,
     attention_mask: Optional[torch.Tensor] = None,
+    labels: Optional[torch.Tensor] = None,
+    num_items_in_batch: Optional[
+        torch.Tensor
+    ] = None,  # the number of tokens within a global batch (including across dp ranks)
+    ignore_index=-100,
 ) -> Union[torch.Tensor, int]:
     r"""
     Computes auxiliary load balancing loss as in Switch Transformer - implemented in Pytorch.
@@ -498,7 +554,7 @@ def load_balancing_loss_func(
     Args:
         gate_logits:
             Logits from the `gate`, should be a tuple of model.config.num_hidden_layers tensors of
-            shape [batch_size X sequence_length, num_experts].
+            shape [batch_size X sequence_length, num_experts]. This has not been softmaxed yet
         num_experts:
             Number of experts
         top_k:
@@ -516,56 +572,71 @@ def load_balancing_loss_func(
 
     if isinstance(gate_logits, tuple):
         compute_device = gate_logits[0].device
-        concatenated_gate_logits = torch.cat([layer_gate.to(compute_device) for layer_gate in gate_logits], dim=0)
+        concatenated_gate_logits = torch.stack(
+            [layer_gate.to(compute_device) for layer_gate in gate_logits], dim=0
+        )  # shape: (num_hidden_layers, batch_size * sequence_length, num_experts)
+        # concatenated_gate_logits = torch.cat([layer_gate.to(compute_device) for layer_gate in gate_logits], dim=0) # shape: (num_hidden_layers * batch_size * sequence_length, num_experts)
 
     routing_weights = torch.nn.functional.softmax(concatenated_gate_logits, dim=-1)
 
-    _, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
+    _, selected_experts = torch.topk(
+        routing_weights, top_k, dim=-1
+    )  # shape: (num_hidden_layers, batch_size * sequence_length, top_k)
 
-    expert_mask = torch.nn.functional.one_hot(selected_experts, num_experts)
+    expert_counts_onehot = torch.nn.functional.one_hot(
+        selected_experts, num_experts
+    )  # shape: (num_hidden_layers, batch_size * sequence_length, top_k, num_experts)
 
-    if attention_mask is None:
+    if attention_mask is None and labels is None:
         # Compute the percentage of tokens routed to each experts
-        tokens_per_expert = torch.mean(expert_mask.float(), dim=0)
+        counts_per_expert = torch.mean(
+            expert_counts_onehot.float(), dim=(1, 2)
+        )  # shape: (num_hidden_layers, num_experts)
 
         # Compute the average probability of routing to these experts
-        router_prob_per_expert = torch.mean(routing_weights, dim=0)
+        prob_per_expert = torch.mean(routing_weights, dim=1)  # shape: (num_hidden_layers, num_experts)
     else:
+        # if there are labels, then we want to ignore the indices that are in the prompt as well (if there is any)
+        if labels is not None:
+            attention_mask = labels != ignore_index
         batch_size, sequence_length = attention_mask.shape
-        num_hidden_layers = concatenated_gate_logits.shape[0] // (batch_size * sequence_length)
+        num_hidden_layers = concatenated_gate_logits.shape[0]
 
         # Compute the mask that masks all padding tokens as 0 with the same shape of expert_mask
         expert_attention_mask = (
             attention_mask[None, :, :, None, None]
             .expand((num_hidden_layers, batch_size, sequence_length, top_k, num_experts))
-            .reshape(-1, top_k, num_experts)
+            .reshape(num_hidden_layers, -1, top_k, num_experts)
             .to(compute_device)
         )
 
         # Compute the percentage of tokens routed to each experts
-        tokens_per_expert = torch.sum(expert_mask.float() * expert_attention_mask, dim=0) / torch.sum(
-            expert_attention_mask, dim=0
-        )
+        # frequency_per_expert = torch.sum(expert_counts_onehot.float() * expert_attention_mask, dim=(1, 2)) / torch.sum(expert_attention_mask, dim=(1,2)) # shape: (num_hidden_layers, num_experts)
+        counts_per_expert = torch.sum(expert_counts_onehot.float() * expert_attention_mask, dim=(1, 2))
 
-        # Compute the mask that masks all padding tokens as 0 with the same shape of tokens_per_expert
+        # Compute the mask that masks all padding tokens as 0 with the same shape of frequency_per_expert
         router_per_expert_attention_mask = (
             attention_mask[None, :, :, None]
-            .expand((num_hidden_layers, batch_size, sequence_length, routing_weights.shape[1]))
-            .reshape(-1, routing_weights.shape[1])
+            .expand((num_hidden_layers, batch_size, sequence_length, num_experts))
+            .reshape(num_hidden_layers, -1, num_experts)
             .to(compute_device)
         )
 
-        # Compute the average probability of routing to these experts
-        router_prob_per_expert = torch.sum(routing_weights * router_per_expert_attention_mask, dim=0) / torch.sum(
-            router_per_expert_attention_mask, dim=0
-        )
+        # average the probability across valid tokens
+        prob_per_expert = torch.sum(routing_weights * router_per_expert_attention_mask, dim=1) / torch.sum(
+            attention_mask
+        )  # shape: (num_hidden_layers, num_experts)
 
-    device_index = routing_weights.device.index if routing_weights.device.index is not None else 0
-    rank = routing_weights.shape[1] * int(device_index)
-    overall_loss = torch.sum(
-        tokens_per_expert[:, rank : rank + routing_weights.shape[1]] * router_prob_per_expert.unsqueeze(0)
-    )
-    return overall_loss * num_experts
+    overall_loss = torch.sum(counts_per_expert * prob_per_expert)
+
+    # we follow olmo-core and use counts for dot product instead of frequency, and divide by total number token across gradient accumulation steps
+    overall_loss = overall_loss / (num_items_in_batch * top_k)
+
+    overall_loss = (
+        overall_loss * num_experts / concatenated_gate_logits.shape[0]
+    )  # times num_experts according to lb equation, divide by num_hidden_layers to get average over layers (which is how olmo-core is implemented to make loss agnostic to number of layers)
+
+    return overall_loss
 
 
 class FlexOlmoNoQKNormPrenormForCausalLM(FlexOlmoNoQKNormPrenormPreTrainedModel, GenerationMixin):
@@ -654,29 +725,36 @@ class FlexOlmoNoQKNormPrenormForCausalLM(FlexOlmoNoQKNormPrenormPreTrainedModel,
         logits = self.lm_head(hidden_states[:, slice_indices, :])
 
         loss = None
+        ce_loss = None
         if labels is not None:
-            loss = self.loss_function(logits, labels, self.vocab_size, **kwargs)
+            ce_loss = self.loss_function(logits, labels, self.vocab_size, **kwargs)
+            loss = ce_loss
 
-        aux_loss = None
+        lb_loss = None
+
         if output_router_logits:
-            aux_loss = load_balancing_loss_func(
+            lb_loss = load_balancing_loss_func_olmoe(
                 outputs.router_logits if return_dict else outputs[-1],
                 self.num_experts,
                 self.num_experts_per_tok,
                 attention_mask,
+                labels,
+                **kwargs,
             )
             if labels is not None:
-                loss += self.router_aux_loss_coef * aux_loss.to(loss.device)  # make sure to reside in the same device
+                loss += self.router_aux_loss_coef * lb_loss.to(loss.device)  # make sure to reside in the same device
 
         if not return_dict:
             output = (logits,) + outputs[1:]
             if output_router_logits:
-                output = (aux_loss,) + output
+                output = (lb_loss,) + output
             return (loss,) + output if loss is not None else output
 
         return MoeCausalLMOutputWithPast(
             loss=loss,
-            aux_loss=aux_loss,
+            aux_loss=lb_loss,
+            lb_loss=lb_loss.detach().clone(),  # for logging callback
+            ce_loss=ce_loss.detach().clone(),  # for logging callback
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
