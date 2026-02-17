@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import Callable, Optional, Union
 
 import torch
+import torch.nn.functional as F
 
 from ...cache_utils import Cache
 from ...modeling_utils import ALL_ATTENTION_FUNCTIONS
@@ -30,6 +31,7 @@ from ..flex_olmo.modeling_flex_olmo import (
     FlexOlmoModel,
     FlexOlmoPreTrainedModel,
     FlexOlmoRMSNorm,
+    FlexOlmoSparseMoeBlock,
     apply_rotary_pos_emb,
     eager_attention_forward,
 )
@@ -47,6 +49,66 @@ class FlexOlmoNoQKNormPrenormConfig(FlexOlmoConfig):
         "layers.*.mlp.up_proj": "colwise",
         "layers.*.mlp.down_proj": "rowwise",
     }
+
+    def __init__(
+        self,
+        vocab_size=100352,
+        hidden_size=4096,
+        intermediate_size=11008,
+        num_hidden_layers=32,
+        num_attention_heads=32,
+        num_key_value_heads=None,
+        hidden_act="silu",
+        max_position_embeddings=4096,
+        initializer_range=0.02,
+        rms_norm_eps=1e-06,
+        use_cache=True,
+        pad_token_id=100277,
+        bos_token_id=None,
+        eos_token_id=100257,
+        tie_word_embeddings=False,
+        rope_theta=500000.0,
+        rope_scaling=None,
+        attention_bias=False,
+        attention_dropout=0.0,
+        num_experts_per_tok=5,
+        num_experts=7,
+        output_router_logits=False,
+        router_aux_loss_coef=0.01,
+        norm_topk_prob=False,
+        num_shared_experts=0,
+        **kwargs,
+    ):
+        super().__init__(
+            vocab_size=vocab_size,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_hidden_layers=num_hidden_layers,
+            num_attention_heads=num_attention_heads,
+            num_key_value_heads=num_key_value_heads,
+            hidden_act=hidden_act,
+            max_position_embeddings=max_position_embeddings,
+            initializer_range=initializer_range,
+            rms_norm_eps=rms_norm_eps,
+            use_cache=use_cache,
+            pad_token_id=pad_token_id,
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
+            tie_word_embeddings=tie_word_embeddings,
+            rope_theta=rope_theta,
+            rope_scaling=rope_scaling,
+            attention_bias=attention_bias,
+            attention_dropout=attention_dropout,
+            num_experts_per_tok=num_experts_per_tok,
+            num_experts=num_experts,
+            output_router_logits=output_router_logits,
+            router_aux_loss_coef=router_aux_loss_coef,
+            norm_topk_prob=norm_topk_prob,
+            **kwargs,
+        )
+        assert num_shared_experts <= num_experts, "num_shared_experts cannot be greater than num_experts"
+
+        self.num_shared_experts = num_shared_experts  # note: we don't care about pruning here - pruning should be handled by the pruning script - the model should just assume that it will use all the experts available
 
 
 class FlexOlmoNoQKNormPrenormRMSNorm(FlexOlmoRMSNorm):
@@ -111,11 +173,97 @@ class FlexOlmoNoQKNormPrenormAttention(FlexOlmoAttention):
         return attn_output, attn_weights
 
 
+class FlexOlmoNoQKNormPrenormSparseMoeBlock(FlexOlmoSparseMoeBlock):
+    def __init__(self, config):
+        super().__init__(config)
+
+        self.num_shared_experts = config.num_shared_experts
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
+        # router_logits: (batch * sequence_length, n_experts)
+        router_logits = self.gate(hidden_states)
+
+        if self.num_shared_experts > 0:
+            # split the router logits into shared and unshared experts
+            router_logits_standard = router_logits[
+                :, : -self.num_shared_experts
+            ]  # (batch * sequence_length, n_experts - num_shared_experts)
+            router_logits_shared = router_logits[
+                :, -self.num_shared_experts :
+            ]  # (batch * sequence_length, num_shared_experts)
+
+            # compute the routing weights for the standard experts and shared experts separately
+            routing_weights_standard = F.softmax(router_logits_standard, dim=1, dtype=torch.float)
+            routing_weights_shared = F.softmax(router_logits_shared, dim=1, dtype=torch.float)
+
+            # select the routing weights and experts for the standard experts and shared experts separately
+            routing_weights_standard, selected_experts_standard = torch.topk(
+                routing_weights_standard, self.top_k - self.num_shared_experts, dim=-1
+            )
+            routing_weights_shared, selected_experts_shared = torch.topk(
+                routing_weights_shared, self.num_shared_experts, dim=-1
+            )
+
+            # concatenate the routing weights and selected experts for the standard experts and shared experts
+            routing_weights = torch.cat([routing_weights_standard, routing_weights_shared], dim=1)
+            selected_experts = torch.cat(
+                [selected_experts_standard, selected_experts_shared + (self.num_experts - self.num_shared_experts)],
+                dim=1,
+            )  # we need to add the offset to the selected experts for the shared experts since they are at the end of the router logits
+
+            # make sure there are self.top_k experts selected in total
+            assert routing_weights.shape == selected_experts.shape == (batch_size * sequence_length, self.top_k), (
+                f"routing_weights and selected_experts should have the same shape of (batch_size * sequence_length, self.top_k), but got {routing_weights.shape} and {selected_experts.shape}"
+            )
+        else:
+            routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+            routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+
+        if self.norm_topk_prob:
+            if self.num_shared_experts > 0:
+                raise NotImplementedError(
+                    "norm_topk_prob is not implemented for the case where num_shared_experts > 0, but should be a simple change"
+                )
+            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+
+        # we cast back to the input dtype
+        routing_weights = routing_weights.to(hidden_states.dtype)
+
+        final_hidden_states = torch.zeros(
+            (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
+        )
+
+        # One hot encode the selected experts to create an expert mask
+        # this will be used to easily index which expert is going to be selected
+        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
+
+        # Loop over all available experts in the model and perform the computation on each expert
+        for expert_idx in range(self.num_experts):
+            expert_layer = self.experts[expert_idx]
+            idx, top_x = torch.where(expert_mask[expert_idx])
+
+            # Index the correct hidden states and compute the expert hidden state for
+            # the current expert. We need to make sure to multiply the output hidden
+            # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
+            current_state = hidden_states[None, top_x].reshape(-1, hidden_dim)
+            current_hidden_states = expert_layer(current_state) * routing_weights[top_x, idx, None]
+
+            # However `index_add_` only support torch tensors for indexing so we'll use
+            # the `top_x` tensor here.
+            final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
+        final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+        return final_hidden_states, router_logits
+
+
 class FlexOlmoNoQKNormPrenormDecoderLayer(FlexOlmoDecoderLayer):
     def __init__(self, config: FlexOlmoNoQKNormPrenormConfig, layer_idx: int):
         super().__init__(config, layer_idx)
         del self.post_attention_layernorm
         del self.post_feedforward_layernorm
+
+        self.mlp = FlexOlmoNoQKNormPrenormSparseMoeBlock(config)
 
         self.pre_attention_layernorm = FlexOlmoNoQKNormPrenormRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.pre_feedforward_layernorm = FlexOlmoNoQKNormPrenormRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -222,6 +370,7 @@ def load_balancing_loss_func_olmoe(
         torch.Tensor
     ] = None,  # the number of tokens within a global batch (including across dp ranks)
     ignore_index=-100,
+    num_shared_experts=0,
 ) -> Union[torch.Tensor, int]:
     r"""
     Computes auxiliary load balancing loss as in Switch Transformer - implemented in Pytorch.
@@ -255,6 +404,13 @@ def load_balancing_loss_func_olmoe(
             [layer_gate.to(compute_device) for layer_gate in gate_logits], dim=0
         )  # shape: (num_hidden_layers, batch_size * sequence_length, num_experts)
         # concatenated_gate_logits = torch.cat([layer_gate.to(compute_device) for layer_gate in gate_logits], dim=0) # shape: (num_hidden_layers * batch_size * sequence_length, num_experts)
+
+    # remove the shared experts from the gate logits since they are not used for routing in the loss function
+    if num_shared_experts > 0:
+        concatenated_gate_logits = concatenated_gate_logits[:, :, :-num_shared_experts]
+        # adjust the num_experts and top_k accordingly for the loss computation
+        num_experts = num_experts - num_shared_experts
+        top_k = top_k - num_shared_experts
 
     routing_weights = torch.nn.functional.softmax(concatenated_gate_logits, dim=-1)
 
@@ -417,6 +573,7 @@ class FlexOlmoNoQKNormPrenormForCausalLM(FlexOlmoForCausalLM):
                 self.num_experts_per_tok,
                 attention_mask,
                 labels,
+                num_shared_experts=self.config.num_shared_experts,
                 **kwargs,
             )
             if labels is not None:

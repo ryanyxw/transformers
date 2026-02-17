@@ -155,6 +155,7 @@ class FlexOlmoNoQKNormPrenormConfig(PretrainedConfig):
         output_router_logits=False,
         router_aux_loss_coef=0.01,
         norm_topk_prob=False,
+        num_shared_experts=0,
         **kwargs,
     ):
         super().__init__(
@@ -194,6 +195,9 @@ class FlexOlmoNoQKNormPrenormConfig(PretrainedConfig):
         if self.rope_scaling is not None and "type" in self.rope_scaling:
             self.rope_scaling["rope_type"] = self.rope_scaling["type"]
         rope_config_validation(self)
+        assert num_shared_experts <= num_experts, "num_shared_experts cannot be greater than num_experts"
+
+        self.num_shared_experts = num_shared_experts  # note: we don't care about pruning here - pruning should be handled by the pruning script - the model should just assume that it will use all the experts available
 
 
 __all__ = ["FlexOlmoNoQKNormPrenormConfig"]
