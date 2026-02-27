@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import Callable, Optional, Union
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from ...cache_utils import Cache
@@ -28,6 +29,7 @@ from ..flex_olmo.modeling_flex_olmo import (
     FlexOlmoAttention,
     FlexOlmoDecoderLayer,
     FlexOlmoForCausalLM,
+    FlexOlmoMLP,
     FlexOlmoModel,
     FlexOlmoPreTrainedModel,
     FlexOlmoRMSNorm,
@@ -77,6 +79,8 @@ class FlexOlmoNoQKNormPrenormConfig(FlexOlmoConfig):
         router_aux_loss_coef=0.01,
         norm_topk_prob=False,
         num_shared_experts=0,
+        num_experts_per_layer: Optional[list[int]] = None,
+        num_shared_experts_per_layer: Optional[list[int]] = None,
         **kwargs,
     ):
         super().__init__(
@@ -109,9 +113,15 @@ class FlexOlmoNoQKNormPrenormConfig(FlexOlmoConfig):
         assert num_shared_experts <= num_experts, "num_shared_experts cannot be greater than num_experts"
 
         self.num_shared_experts = num_shared_experts  # note: we don't care about pruning here - pruning should be handled by the pruning script - the model should just assume that it will use all the experts available
+        self.num_experts_per_layer = num_experts_per_layer
+        self.num_shared_experts_per_layer = num_shared_experts_per_layer
 
 
 class FlexOlmoNoQKNormPrenormRMSNorm(FlexOlmoRMSNorm):
+    pass
+
+
+class FlexOlmoNoQKNormPrenormMLP(FlexOlmoMLP):
     pass
 
 
@@ -174,10 +184,14 @@ class FlexOlmoNoQKNormPrenormAttention(FlexOlmoAttention):
 
 
 class FlexOlmoNoQKNormPrenormSparseMoeBlock(FlexOlmoSparseMoeBlock):
-    def __init__(self, config):
+    def __init__(self, config, num_experts: int, num_shared_experts: int):
         super().__init__(config)
+        del self.num_experts
+        del self.experts
 
-        self.num_shared_experts = config.num_shared_experts
+        self.num_shared_experts = num_shared_experts
+        self.num_experts = num_experts
+        self.experts = nn.ModuleList([FlexOlmoNoQKNormPrenormMLP(config) for _ in range(self.num_experts)])
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
@@ -258,12 +272,14 @@ class FlexOlmoNoQKNormPrenormSparseMoeBlock(FlexOlmoSparseMoeBlock):
 
 
 class FlexOlmoNoQKNormPrenormDecoderLayer(FlexOlmoDecoderLayer):
-    def __init__(self, config: FlexOlmoNoQKNormPrenormConfig, layer_idx: int):
+    def __init__(
+        self, config: FlexOlmoNoQKNormPrenormConfig, layer_idx: int, num_experts: int, num_shared_experts: int
+    ):
         super().__init__(config, layer_idx)
         del self.post_attention_layernorm
         del self.post_feedforward_layernorm
 
-        self.mlp = FlexOlmoNoQKNormPrenormSparseMoeBlock(config)
+        self.mlp = FlexOlmoNoQKNormPrenormSparseMoeBlock(config, num_experts, num_shared_experts)
 
         self.pre_attention_layernorm = FlexOlmoNoQKNormPrenormRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.pre_feedforward_layernorm = FlexOlmoNoQKNormPrenormRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -307,7 +323,40 @@ class FlexOlmoNoQKNormPrenormPreTrainedModel(FlexOlmoPreTrainedModel):
 
 
 class FlexOlmoNoQKNormPrenormModel(FlexOlmoModel):
-    pass
+    def __init__(self, config):
+        super().__init__(config)
+        del self.layers
+
+        # Check if per-layer expert counts are specified
+        num_experts_per_layer = getattr(config, "num_experts_per_layer", None)
+        num_shared_experts_per_layer = getattr(config, "num_shared_experts_per_layer", None)
+
+        if num_experts_per_layer is not None:
+            # Use per-layer expert counts
+            assert len(num_experts_per_layer) == config.num_hidden_layers, (
+                f"num_experts_per_layer has length {len(num_experts_per_layer)} but model has {config.num_hidden_layers} layers"
+            )
+            if num_shared_experts_per_layer is None:
+                # Default: use config.num_shared_experts for all layers, but cap at layer's num_experts
+                num_shared_experts_per_layer = [
+                    min(config.num_shared_experts, num_experts_per_layer[i]) for i in range(config.num_hidden_layers)
+                ]
+            self.layers = nn.ModuleList(
+                [
+                    FlexOlmoNoQKNormPrenormDecoderLayer(
+                        config, layer_idx, num_experts_per_layer[layer_idx], num_shared_experts_per_layer[layer_idx]
+                    )
+                    for layer_idx in range(config.num_hidden_layers)
+                ]
+            )
+        else:
+            # Fall back to original behavior: all layers use config.num_experts
+            self.layers = nn.ModuleList(
+                [
+                    FlexOlmoNoQKNormPrenormDecoderLayer(config, layer_idx)
+                    for layer_idx in range(config.num_hidden_layers)
+                ]
+            )
 
 
 @dataclass
@@ -371,9 +420,14 @@ def load_balancing_loss_func_olmoe(
     ] = None,  # the number of tokens within a global batch (including across dp ranks)
     ignore_index=-100,
     num_shared_experts=0,
+    num_experts_per_layer: Optional[list[int]] = None,
+    num_shared_experts_per_layer: Optional[list[int]] = None,
 ) -> Union[torch.Tensor, int]:
     r"""
     Computes auxiliary load balancing loss as in Switch Transformer - implemented in Pytorch.
+
+    This version supports variable per-layer expert counts by computing the loss
+    per-layer individually and averaging across layers.
 
     See Switch Transformer (https://huggingface.co/papers/2101.03961) for more details. This function implements the loss
     function presented in equations (4) - (6) of the paper. It aims at penalizing cases where the routing between
@@ -382,15 +436,20 @@ def load_balancing_loss_func_olmoe(
     Args:
         gate_logits:
             Logits from the `gate`, should be a tuple of model.config.num_hidden_layers tensors of
-            shape [batch_size X sequence_length, num_experts]. This has not been softmaxed yet
+            shape [batch_size X sequence_length, num_experts]. This has not been softmaxed yet.
+            Note: each layer may have a different num_experts if num_experts_per_layer is set.
         num_experts:
-            Number of experts
+            Number of experts (used as fallback if num_experts_per_layer is None)
         top_k:
             The number of experts to route per-token, can be also interpreted as the `top-k` routing
             parameter.
         attention_mask (`torch.Tensor`, *optional*):
             The attention_mask used in forward function
             shape [batch_size X sequence_length] if not None.
+        num_experts_per_layer:
+            List of expert counts per layer. If None, uses num_experts for all layers.
+        num_shared_experts_per_layer:
+            List of shared expert counts per layer. If None, uses num_shared_experts for all layers.
 
     Returns:
         The auxiliary loss.
@@ -398,93 +457,181 @@ def load_balancing_loss_func_olmoe(
     if gate_logits is None or not isinstance(gate_logits, tuple):
         return 0
 
-    if isinstance(gate_logits, tuple):
-        compute_device = gate_logits[0].device
+    compute_device = gate_logits[0].device
+    num_hidden_layers = len(gate_logits)
+
+    # Check if we have variable expert counts
+    has_variable_experts = num_experts_per_layer is not None and len(set(num_experts_per_layer)) > 1
+
+    if not has_variable_experts:
+        # All layers have the same expert count - use the original stacking approach
         concatenated_gate_logits = torch.stack(
             [layer_gate.to(compute_device) for layer_gate in gate_logits], dim=0
         )  # shape: (num_hidden_layers, batch_size * sequence_length, num_experts)
-        # concatenated_gate_logits = torch.cat([layer_gate.to(compute_device) for layer_gate in gate_logits], dim=0) # shape: (num_hidden_layers * batch_size * sequence_length, num_experts)
 
-    # remove the shared experts from the gate logits since they are not used for routing in the loss function
-    if num_shared_experts > 0:
-        concatenated_gate_logits = concatenated_gate_logits[:, :, :-num_shared_experts]
-        # adjust the num_experts and top_k accordingly for the loss computation
-        num_experts = num_experts - num_shared_experts
-        top_k = top_k - num_shared_experts
+        # remove the shared experts from the gate logits since they are not used for routing in the loss function
+        if num_shared_experts > 0:
+            concatenated_gate_logits = concatenated_gate_logits[:, :, :-num_shared_experts]
+            # adjust the num_experts and top_k accordingly for the loss computation
+            num_experts = num_experts - num_shared_experts
+            top_k = top_k - num_shared_experts
 
-    routing_weights = torch.nn.functional.softmax(concatenated_gate_logits, dim=-1)
+        routing_weights = torch.nn.functional.softmax(concatenated_gate_logits, dim=-1)
 
-    _, selected_experts = torch.topk(
-        routing_weights, top_k, dim=-1
-    )  # shape: (num_hidden_layers, batch_size * sequence_length, top_k)
+        _, selected_experts = torch.topk(
+            routing_weights, top_k, dim=-1
+        )  # shape: (num_hidden_layers, batch_size * sequence_length, top_k)
 
-    expert_counts_onehot = torch.nn.functional.one_hot(
-        selected_experts, num_experts
-    )  # shape: (num_hidden_layers, batch_size * sequence_length, top_k, num_experts)
+        expert_counts_onehot = torch.nn.functional.one_hot(
+            selected_experts, num_experts
+        )  # shape: (num_hidden_layers, batch_size * sequence_length, top_k, num_experts)
 
-    if attention_mask is None and labels is None:
-        # Compute the percentage of tokens routed to each experts
-        counts_per_expert = torch.mean(
-            expert_counts_onehot.float(), dim=(1, 2)
-        )  # shape: (num_hidden_layers, num_experts)
+        if attention_mask is None and labels is None:
+            # Compute the percentage of tokens routed to each experts
+            counts_per_expert = torch.mean(
+                expert_counts_onehot.float(), dim=(1, 2)
+            )  # shape: (num_hidden_layers, num_experts)
 
-        # Compute the average probability of routing to these experts
-        prob_per_expert = torch.mean(routing_weights, dim=1)  # shape: (num_hidden_layers, num_experts)
+            # Compute the average probability of routing to these experts
+            prob_per_expert = torch.mean(routing_weights, dim=1)  # shape: (num_hidden_layers, num_experts)
+        else:
+            # if there are labels, then we want to ignore the indices that are in the prompt as well (if there is any)
+            if labels is not None:
+                attention_mask = labels != ignore_index
+            batch_size, sequence_length = attention_mask.shape
+
+            # Compute the mask that masks all padding tokens as 0 with the same shape of expert_mask
+            expert_attention_mask = (
+                attention_mask[None, :, :, None, None]
+                .expand((num_hidden_layers, batch_size, sequence_length, top_k, num_experts))
+                .reshape(num_hidden_layers, -1, top_k, num_experts)
+                .to(compute_device)
+            )
+
+            # Compute the percentage of tokens routed to each experts
+            counts_per_expert = torch.sum(expert_counts_onehot.float() * expert_attention_mask, dim=(1, 2))
+
+            # Compute the mask that masks all padding tokens as 0 with the same shape of frequency_per_expert
+            router_per_expert_attention_mask = (
+                attention_mask[None, :, :, None]
+                .expand((num_hidden_layers, batch_size, sequence_length, num_experts))
+                .reshape(num_hidden_layers, -1, num_experts)
+                .to(compute_device)
+            )
+
+            # average the probability across valid tokens
+            prob_per_expert = torch.sum(routing_weights * router_per_expert_attention_mask, dim=1) / torch.sum(
+                attention_mask
+            )  # shape: (num_hidden_layers, num_experts)
+
+        overall_loss = torch.sum(counts_per_expert * prob_per_expert)
+
+        # Fallback when num_items_in_batch isn't provided (e.g., manual forward calls)
+        if num_items_in_batch is None:
+            if labels is not None:
+                num_items_in_batch = (labels != ignore_index).sum()
+            elif attention_mask is not None:
+                num_items_in_batch = attention_mask.sum()
+            else:
+                # fall back to total tokens in batch/seq from gate logits
+                num_items_in_batch = gate_logits[0].shape[0]
+
+            if torch.is_tensor(num_items_in_batch):
+                num_items_in_batch = num_items_in_batch.to(compute_device)
+
+        # we follow olmo-core and use counts for dot product instead of frequency, and divide by total number token across gradient accumulation steps
+        overall_loss = overall_loss / (num_items_in_batch * top_k)
+
+        overall_loss = (
+            overall_loss * num_experts / num_hidden_layers
+        )  # times num_experts according to lb equation, divide by num_hidden_layers to get average over layers
+
+        return overall_loss
+
     else:
-        # if there are labels, then we want to ignore the indices that are in the prompt as well (if there is any)
+        # Variable expert counts - compute loss per layer and average
+        if num_shared_experts_per_layer is None:
+            num_shared_experts_per_layer = [num_shared_experts] * num_hidden_layers
+
+        # Compute attention mask once
         if labels is not None:
             attention_mask = labels != ignore_index
-        batch_size, sequence_length = attention_mask.shape
-        num_hidden_layers = concatenated_gate_logits.shape[0]
 
-        # Compute the mask that masks all padding tokens as 0 with the same shape of expert_mask
-        expert_attention_mask = (
-            attention_mask[None, :, :, None, None]
-            .expand((num_hidden_layers, batch_size, sequence_length, top_k, num_experts))
-            .reshape(num_hidden_layers, -1, top_k, num_experts)
-            .to(compute_device)
-        )
+        if attention_mask is not None:
+            batch_size, sequence_length = attention_mask.shape
 
-        # Compute the percentage of tokens routed to each experts
-        # frequency_per_expert = torch.sum(expert_counts_onehot.float() * expert_attention_mask, dim=(1, 2)) / torch.sum(expert_attention_mask, dim=(1,2)) # shape: (num_hidden_layers, num_experts)
-        counts_per_expert = torch.sum(expert_counts_onehot.float() * expert_attention_mask, dim=(1, 2))
+        # Fallback when num_items_in_batch isn't provided
+        if num_items_in_batch is None:
+            if labels is not None:
+                num_items_in_batch = (labels != ignore_index).sum()
+            elif attention_mask is not None:
+                num_items_in_batch = attention_mask.sum()
+            else:
+                num_items_in_batch = gate_logits[0].shape[0]
 
-        # Compute the mask that masks all padding tokens as 0 with the same shape of frequency_per_expert
-        router_per_expert_attention_mask = (
-            attention_mask[None, :, :, None]
-            .expand((num_hidden_layers, batch_size, sequence_length, num_experts))
-            .reshape(num_hidden_layers, -1, num_experts)
-            .to(compute_device)
-        )
+            if torch.is_tensor(num_items_in_batch):
+                num_items_in_batch = num_items_in_batch.to(compute_device)
 
-        # average the probability across valid tokens
-        prob_per_expert = torch.sum(routing_weights * router_per_expert_attention_mask, dim=1) / torch.sum(
-            attention_mask
-        )  # shape: (num_hidden_layers, num_experts)
+        layer_losses = []
 
-    overall_loss = torch.sum(counts_per_expert * prob_per_expert)
+        for layer_idx, layer_gate in enumerate(gate_logits):
+            layer_gate = layer_gate.to(compute_device)
+            layer_num_experts = num_experts_per_layer[layer_idx]
+            layer_num_shared = num_shared_experts_per_layer[layer_idx]
 
-    # Fallback when num_items_in_batch isn't provided (e.g., manual forward calls)
-    if num_items_in_batch is None:
-        if labels is not None:
-            num_items_in_batch = (labels != ignore_index).sum()
-        elif attention_mask is not None:
-            num_items_in_batch = attention_mask.sum()
-        else:
-            # fall back to total tokens in batch/seq from gate logits
-            num_items_in_batch = gate_logits[0].shape[0]
+            # Remove shared experts from logits
+            if layer_num_shared > 0:
+                layer_gate = layer_gate[:, :-layer_num_shared]
+                effective_num_experts = layer_num_experts - layer_num_shared
+                effective_top_k = top_k - layer_num_shared
+            else:
+                effective_num_experts = layer_num_experts
+                effective_top_k = top_k
 
-        if torch.is_tensor(num_items_in_batch):
-            num_items_in_batch = num_items_in_batch.to(compute_device)
+            # Compute routing weights
+            routing_weights = torch.nn.functional.softmax(layer_gate, dim=-1)
 
-    # we follow olmo-core and use counts for dot product instead of frequency, and divide by total number token across gradient accumulation steps
-    overall_loss = overall_loss / (num_items_in_batch * top_k)
+            _, selected_experts = torch.topk(
+                routing_weights, effective_top_k, dim=-1
+            )  # shape: (batch_size * sequence_length, top_k)
 
-    overall_loss = (
-        overall_loss * num_experts / concatenated_gate_logits.shape[0]
-    )  # times num_experts according to lb equation, divide by num_hidden_layers to get average over layers (which is how olmo-core is implemented to make loss agnostic to number of layers)
+            expert_counts_onehot = torch.nn.functional.one_hot(
+                selected_experts, effective_num_experts
+            )  # shape: (batch_size * sequence_length, top_k, num_experts)
 
-    return overall_loss
+            if attention_mask is None:
+                counts_per_expert = torch.mean(expert_counts_onehot.float(), dim=(0, 1))  # shape: (num_experts,)
+                prob_per_expert = torch.mean(routing_weights, dim=0)  # shape: (num_experts,)
+            else:
+                # Reshape for masking
+                expert_attention_mask = (
+                    attention_mask[:, :, None, None]
+                    .expand((batch_size, sequence_length, effective_top_k, effective_num_experts))
+                    .reshape(-1, effective_top_k, effective_num_experts)
+                    .to(compute_device)
+                )
+
+                counts_per_expert = torch.sum(expert_counts_onehot.float() * expert_attention_mask, dim=(0, 1))
+
+                router_attention_mask = (
+                    attention_mask[:, :, None]
+                    .expand((batch_size, sequence_length, effective_num_experts))
+                    .reshape(-1, effective_num_experts)
+                    .to(compute_device)
+                )
+
+                prob_per_expert = torch.sum(routing_weights * router_attention_mask, dim=0) / torch.sum(attention_mask)
+
+            layer_loss = torch.sum(counts_per_expert * prob_per_expert)
+            layer_loss = layer_loss / (num_items_in_batch * effective_top_k)
+            layer_loss = layer_loss * effective_num_experts
+
+            layer_losses.append(layer_loss)
+
+        # Average across layers
+        overall_loss = torch.stack(layer_losses).mean()
+
+        return overall_loss
 
 
 class FlexOlmoNoQKNormPrenormForCausalLM(FlexOlmoForCausalLM):
@@ -567,6 +714,10 @@ class FlexOlmoNoQKNormPrenormForCausalLM(FlexOlmoForCausalLM):
         lb_loss = None
 
         if output_router_logits:
+            # Get per-layer expert counts if available
+            num_experts_per_layer = getattr(self.config, "num_experts_per_layer", None)
+            num_shared_experts_per_layer = getattr(self.config, "num_shared_experts_per_layer", None)
+
             lb_loss = load_balancing_loss_func_olmoe(
                 outputs.router_logits if return_dict else outputs[-1],
                 self.num_experts,
@@ -574,6 +725,8 @@ class FlexOlmoNoQKNormPrenormForCausalLM(FlexOlmoForCausalLM):
                 attention_mask,
                 labels,
                 num_shared_experts=self.config.num_shared_experts,
+                num_experts_per_layer=num_experts_per_layer,
+                num_shared_experts_per_layer=num_shared_experts_per_layer,
                 **kwargs,
             )
             if labels is not None:

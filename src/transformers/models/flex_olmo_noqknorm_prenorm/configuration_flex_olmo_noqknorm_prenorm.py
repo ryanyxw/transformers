@@ -19,6 +19,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Optional
+
 from ...configuration_utils import PretrainedConfig
 from ...modeling_rope_utils import rope_config_validation
 
@@ -156,6 +158,8 @@ class FlexOlmoNoQKNormPrenormConfig(PretrainedConfig):
         router_aux_loss_coef=0.01,
         norm_topk_prob=False,
         num_shared_experts=0,
+        num_experts_per_layer: Optional[list[int]] = None,
+        num_shared_experts_per_layer: Optional[list[int]] = None,
         **kwargs,
     ):
         super().__init__(
@@ -198,6 +202,8 @@ class FlexOlmoNoQKNormPrenormConfig(PretrainedConfig):
         assert num_shared_experts <= num_experts, "num_shared_experts cannot be greater than num_experts"
 
         self.num_shared_experts = num_shared_experts  # note: we don't care about pruning here - pruning should be handled by the pruning script - the model should just assume that it will use all the experts available
+        self.num_experts_per_layer = num_experts_per_layer
+        self.num_shared_experts_per_layer = num_shared_experts_per_layer
 
 
 __all__ = ["FlexOlmoNoQKNormPrenormConfig"]
