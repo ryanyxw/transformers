@@ -482,7 +482,9 @@ class FlexOlmoNoQKNormPrenormModel(FlexOlmoNoQKNormPrenormPreTrainedModel):
             # Fall back to original behavior: all layers use config.num_experts
             self.layers = nn.ModuleList(
                 [
-                    FlexOlmoNoQKNormPrenormDecoderLayer(config, layer_idx)
+                    FlexOlmoNoQKNormPrenormDecoderLayer(
+                        config, layer_idx, config.num_experts, config.num_shared_experts
+                    )
                     for layer_idx in range(config.num_hidden_layers)
                 ]
             )
