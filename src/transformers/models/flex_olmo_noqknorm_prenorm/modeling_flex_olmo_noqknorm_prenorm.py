@@ -232,10 +232,10 @@ class FlexOlmoNoQKNormPrenormSparseMoeBlock(nn.Module):
         super().__init__()
         self.top_k = config.num_experts_per_tok
         self.norm_topk_prob = config.norm_topk_prob
-        self.gate = nn.Linear(config.hidden_size, self.num_experts, bias=False)
 
         self.num_shared_experts = num_shared_experts
         self.num_experts = num_experts
+        self.gate = nn.Linear(config.hidden_size, self.num_experts, bias=False)
         self.experts = nn.ModuleList([FlexOlmoNoQKNormPrenormMLP(config) for _ in range(self.num_experts)])
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:

@@ -188,9 +188,11 @@ class FlexOlmoNoQKNormPrenormSparseMoeBlock(FlexOlmoSparseMoeBlock):
         super().__init__(config)
         del self.num_experts
         del self.experts
+        del self.gate
 
         self.num_shared_experts = num_shared_experts
         self.num_experts = num_experts
+        self.gate = nn.Linear(config.hidden_size, self.num_experts, bias=False)
         self.experts = nn.ModuleList([FlexOlmoNoQKNormPrenormMLP(config) for _ in range(self.num_experts)])
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
