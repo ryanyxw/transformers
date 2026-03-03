@@ -82,6 +82,7 @@ class FlexOlmoNoQKNormPrenormConfig(FlexOlmoConfig):
         num_experts_per_layer: Optional[list[int]] = None,
         num_shared_experts_per_layer: Optional[list[int]] = None,
         dense_intermediate_size: Optional[int] = None,
+        dense_mlp_bias: bool = False,  # Some densefirst models were accidentally trained with bias=True on dense MLPs due to OLMo Core's FeedForwardConfig defaulting bias to True when not explicitly set
         **kwargs,
     ):
         super().__init__(
@@ -117,6 +118,7 @@ class FlexOlmoNoQKNormPrenormConfig(FlexOlmoConfig):
         self.num_experts_per_layer = num_experts_per_layer
         self.num_shared_experts_per_layer = num_shared_experts_per_layer
         self.dense_intermediate_size = dense_intermediate_size
+        self.dense_mlp_bias = dense_mlp_bias
 
 
 class FlexOlmoNoQKNormPrenormRMSNorm(FlexOlmoRMSNorm):
@@ -124,7 +126,17 @@ class FlexOlmoNoQKNormPrenormRMSNorm(FlexOlmoRMSNorm):
 
 
 class FlexOlmoNoQKNormPrenormMLP(FlexOlmoMLP):
-    pass
+    def __init__(self, config):
+        super().__init__(config)
+        # Support bias for dense layers (e.g., densefirst models)
+        dense_mlp_bias = getattr(config, "dense_mlp_bias", False)
+        if dense_mlp_bias:
+            del self.gate_proj
+            del self.up_proj
+            del self.down_proj
+            self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=True)
+            self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=True)
+            self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=True)
 
 
 class FlexOlmoNoQKNormPrenormAttention(FlexOlmoAttention):
@@ -298,6 +310,7 @@ class FlexOlmoNoQKNormPrenormDecoderLayer(FlexOlmoDecoderLayer):
 
             dense_config = copy.copy(config)
             dense_config.intermediate_size = dense_intermediate_size
+            dense_config.dense_mlp_bias = getattr(config, "dense_mlp_bias", False)
             self.mlp = FlexOlmoNoQKNormPrenormMLP(dense_config)
         else:
             self.mlp = FlexOlmoNoQKNormPrenormSparseMoeBlock(config, num_experts, num_shared_experts)
