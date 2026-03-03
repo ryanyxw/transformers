@@ -324,8 +324,6 @@ class FlexOlmoNoQKNormPrenormDecoderLayer(GradientCheckpointingLayer):
         self.hidden_size = config.hidden_size
         self.self_attn = FlexOlmoNoQKNormPrenormAttention(config=config, layer_idx=layer_idx)
 
-        self.mlp = FlexOlmoNoQKNormPrenormSparseMoeBlock(config)
-
         self.num_experts = num_experts
 
         if num_experts == 0:

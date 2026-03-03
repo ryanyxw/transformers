@@ -282,6 +282,7 @@ class FlexOlmoNoQKNormPrenormDecoderLayer(FlexOlmoDecoderLayer):
         super().__init__(config, layer_idx)
         del self.post_attention_layernorm
         del self.post_feedforward_layernorm
+        del self.mlp
 
         self.num_experts = num_experts
 
