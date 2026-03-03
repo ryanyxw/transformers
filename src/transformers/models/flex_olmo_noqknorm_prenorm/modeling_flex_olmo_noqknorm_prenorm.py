@@ -73,7 +73,9 @@ class FlexOlmoNoQKNormPrenormMLP(nn.Module):
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
-        # Support bias for dense layers (e.g., densefirst models)
+        # Some densefirst models were accidentally trained with bias=True on dense MLPs
+        # (OLMo Core's FeedForwardConfig defaults bias to True when not explicitly set).
+        # We support loading those weights here.
         dense_mlp_bias = getattr(config, "dense_mlp_bias", False)
         if dense_mlp_bias:
             del self.gate_proj
@@ -245,7 +247,12 @@ class FlexOlmoNoQKNormPrenormSparseMoeBlock(nn.Module):
         self.num_shared_experts = num_shared_experts
         self.num_experts = num_experts
         self.gate = nn.Linear(config.hidden_size, self.num_experts, bias=False)
-        self.experts = nn.ModuleList([FlexOlmoNoQKNormPrenormMLP(config) for _ in range(self.num_experts)])
+        # Expert MLPs should never use dense_mlp_bias (that's only for dense FFN layers)
+        import copy
+
+        expert_config = copy.copy(config)
+        expert_config.dense_mlp_bias = False
+        self.experts = nn.ModuleList([FlexOlmoNoQKNormPrenormMLP(expert_config) for _ in range(self.num_experts)])
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, sequence_length, hidden_dim = hidden_states.shape

@@ -211,6 +211,7 @@ class FlexOlmoNoQKNormPrenormSparseMoeBlock(FlexOlmoSparseMoeBlock):
         self.gate = nn.Linear(config.hidden_size, self.num_experts, bias=False)
         # Expert MLPs should never use dense_mlp_bias (that's only for dense FFN layers)
         import copy
+
         expert_config = copy.copy(config)
         expert_config.dense_mlp_bias = False
         self.experts = nn.ModuleList([FlexOlmoNoQKNormPrenormMLP(expert_config) for _ in range(self.num_experts)])
