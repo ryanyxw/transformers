@@ -283,7 +283,22 @@ class FlexOlmoNoQKNormPrenormDecoderLayer(FlexOlmoDecoderLayer):
         del self.post_attention_layernorm
         del self.post_feedforward_layernorm
 
-        self.mlp = FlexOlmoNoQKNormPrenormSparseMoeBlock(config, num_experts, num_shared_experts)
+        self.num_experts = num_experts
+
+        if num_experts == 0:
+            # Dense layer: use MLP with dense_intermediate_size
+            dense_intermediate_size = getattr(config, "dense_intermediate_size", None)
+            if dense_intermediate_size is None:
+                raise ValueError(
+                    "num_experts=0 (dense layer) but config.dense_intermediate_size is not set. "
+                    "Please set dense_intermediate_size in the config."
+                )
+            import copy
+            dense_config = copy.copy(config)
+            dense_config.intermediate_size = dense_intermediate_size
+            self.mlp = FlexOlmoNoQKNormPrenormMLP(dense_config)
+        else:
+            self.mlp = FlexOlmoNoQKNormPrenormSparseMoeBlock(config, num_experts, num_shared_experts)
 
         self.pre_attention_layernorm = FlexOlmoNoQKNormPrenormRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.pre_feedforward_layernorm = FlexOlmoNoQKNormPrenormRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -317,7 +332,11 @@ class FlexOlmoNoQKNormPrenormDecoderLayer(FlexOlmoDecoderLayer):
         residual = hidden_states
         # apply norm before feedforward
         hidden_states = self.pre_feedforward_layernorm(hidden_states)
-        hidden_states, _ = self.mlp(hidden_states)
+        mlp_output = self.mlp(hidden_states)
+        if isinstance(mlp_output, tuple):
+            hidden_states, _ = mlp_output
+        else:
+            hidden_states = mlp_output
         hidden_states = residual + hidden_states
         return hidden_states
 
@@ -723,6 +742,13 @@ class FlexOlmoNoQKNormPrenormForCausalLM(FlexOlmoForCausalLM):
             # Get per-layer expert counts if available
             num_experts_per_layer = getattr(self.config, "num_experts_per_layer", None)
             num_shared_experts_per_layer = getattr(self.config, "num_shared_experts_per_layer", None)
+
+            # Filter out dense layers (num_experts == 0) since they produce no router_logits
+            if num_experts_per_layer is not None:
+                moe_mask = [i for i, n in enumerate(num_experts_per_layer) if n > 0]
+                num_experts_per_layer = [num_experts_per_layer[i] for i in moe_mask]
+                if num_shared_experts_per_layer is not None:
+                    num_shared_experts_per_layer = [num_shared_experts_per_layer[i] for i in moe_mask]
 
             lb_loss = load_balancing_loss_func_olmoe(
                 outputs.router_logits if return_dict else outputs[-1],
