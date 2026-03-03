@@ -73,6 +73,15 @@ class FlexOlmoNoQKNormPrenormMLP(nn.Module):
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
+        # Support bias for dense layers (e.g., densefirst models)
+        dense_mlp_bias = getattr(config, "dense_mlp_bias", False)
+        if dense_mlp_bias:
+            del self.gate_proj
+            del self.up_proj
+            del self.down_proj
+            self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=True)
+            self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=True)
+            self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=True)
 
     def forward(self, x):
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
@@ -338,6 +347,7 @@ class FlexOlmoNoQKNormPrenormDecoderLayer(GradientCheckpointingLayer):
 
             dense_config = copy.copy(config)
             dense_config.intermediate_size = dense_intermediate_size
+            dense_config.dense_mlp_bias = getattr(config, "dense_mlp_bias", False)
             self.mlp = FlexOlmoNoQKNormPrenormMLP(dense_config)
         else:
             self.mlp = FlexOlmoNoQKNormPrenormSparseMoeBlock(config, num_experts, num_shared_experts)

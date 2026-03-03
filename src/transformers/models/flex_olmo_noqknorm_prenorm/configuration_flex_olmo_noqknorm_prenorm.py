@@ -161,6 +161,7 @@ class FlexOlmoNoQKNormPrenormConfig(PretrainedConfig):
         num_experts_per_layer: Optional[list[int]] = None,
         num_shared_experts_per_layer: Optional[list[int]] = None,
         dense_intermediate_size: Optional[int] = None,
+        dense_mlp_bias: bool = False,  # Some densefirst models were accidentally trained with bias=True on dense MLPs due to OLMo Core's FeedForwardConfig defaulting bias to True when not explicitly set
         **kwargs,
     ):
         super().__init__(
@@ -206,6 +207,7 @@ class FlexOlmoNoQKNormPrenormConfig(PretrainedConfig):
         self.num_experts_per_layer = num_experts_per_layer
         self.num_shared_experts_per_layer = num_shared_experts_per_layer
         self.dense_intermediate_size = dense_intermediate_size
+        self.dense_mlp_bias = dense_mlp_bias
 
 
 __all__ = ["FlexOlmoNoQKNormPrenormConfig"]
