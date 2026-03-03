@@ -160,6 +160,7 @@ class FlexOlmoNoQKNormPrenormConfig(PretrainedConfig):
         num_shared_experts=0,
         num_experts_per_layer: Optional[list[int]] = None,
         num_shared_experts_per_layer: Optional[list[int]] = None,
+        dense_intermediate_size: Optional[int] = None,
         **kwargs,
     ):
         super().__init__(
@@ -204,6 +205,7 @@ class FlexOlmoNoQKNormPrenormConfig(PretrainedConfig):
         self.num_shared_experts = num_shared_experts  # note: we don't care about pruning here - pruning should be handled by the pruning script - the model should just assume that it will use all the experts available
         self.num_experts_per_layer = num_experts_per_layer
         self.num_shared_experts_per_layer = num_shared_experts_per_layer
+        self.dense_intermediate_size = dense_intermediate_size
 
 
 __all__ = ["FlexOlmoNoQKNormPrenormConfig"]

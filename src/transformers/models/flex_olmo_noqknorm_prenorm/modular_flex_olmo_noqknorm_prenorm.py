@@ -294,6 +294,7 @@ class FlexOlmoNoQKNormPrenormDecoderLayer(FlexOlmoDecoderLayer):
                     "Please set dense_intermediate_size in the config."
                 )
             import copy
+
             dense_config = copy.copy(config)
             dense_config.intermediate_size = dense_intermediate_size
             self.mlp = FlexOlmoNoQKNormPrenormMLP(dense_config)
