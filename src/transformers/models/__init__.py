@@ -128,6 +128,7 @@ if TYPE_CHECKING:
     from .flava import *
     from .flex_olmo import *
     from .flex_olmo_noqknorm_prenorm import *
+    from .flex_olmo_noqknorm_prenorm_shared import *
     from .florence2 import *
     from .fnet import *
     from .focalnet import *
