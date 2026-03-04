@@ -239,12 +239,13 @@ class FlexOlmoNoQKNormPrenormAttention(nn.Module):
 
 
 class FlexOlmoNoQKNormPrenormSparseMoeBlock(nn.Module):
-    def __init__(self, config, num_experts: int, num_shared_experts: int):
+    def __init__(self, config, num_experts: int, num_shared_experts: int, always_active_experts: Optional[list[int]] = None):
         super().__init__()
         self.top_k = config.num_experts_per_tok
         self.norm_topk_prob = config.norm_topk_prob
 
         self.num_shared_experts = num_shared_experts
+        self.always_active_experts = always_active_experts
         self.num_experts = num_experts
         self.gate = nn.Linear(config.hidden_size, self.num_experts, bias=False)
         # Expert MLPs should never use dense_mlp_bias (that's only for dense FFN layers)
@@ -254,13 +255,51 @@ class FlexOlmoNoQKNormPrenormSparseMoeBlock(nn.Module):
         expert_config.dense_mlp_bias = False
         self.experts = nn.ModuleList([FlexOlmoNoQKNormPrenormMLP(expert_config) for _ in range(self.num_experts)])
 
+    def _get_top_k_with_always_active(self, scores: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Select top-k experts where always_active_experts are always included.
+        Softmax is computed over all experts, then always-active are masked out for topk selection.
+        """
+        always_active = self.always_active_experts
+        num_always_active = len(always_active)
+        routed_top_k = self.top_k - num_always_active
+
+        # Mask out always-active experts so they aren't selected by topk.
+        masked_scores = scores.clone()
+        masked_scores[:, always_active] = float("-inf")
+
+        # Select top-(top_k - num_always_active) from the remaining experts.
+        if routed_top_k == 1:
+            _, routed_indices = masked_scores.max(dim=-1, keepdim=True)
+        else:
+            _, routed_indices = torch.topk(masked_scores, routed_top_k, dim=-1)
+
+        # Gather actual weights from original (unmasked) scores.
+        routed_weights = scores.gather(-1, routed_indices)
+
+        # Build always-active indices and weights.
+        always_active_tensor = torch.tensor(always_active, device=scores.device, dtype=routed_indices.dtype)
+        always_active_indices = always_active_tensor.unsqueeze(0).expand(scores.shape[0], num_always_active)
+        always_active_weights = scores.gather(-1, always_active_indices)
+
+        # Concatenate: always-active first, then routed.
+        selected_experts = torch.cat([always_active_indices, routed_indices], dim=-1)
+        routing_weights = torch.cat([always_active_weights, routed_weights], dim=-1)
+
+        return routing_weights, selected_experts
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         # router_logits: (batch * sequence_length, n_experts)
         router_logits = self.gate(hidden_states)
 
-        if self.num_shared_experts > 0:
+        if self.always_active_experts is not None and len(self.always_active_experts) > 0:
+            # Use masking approach: softmax over all experts, mask always-active for topk
+            routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+            routing_weights, selected_experts = self._get_top_k_with_always_active(routing_weights)
+        elif self.num_shared_experts > 0:
+            # Legacy path: shared experts are the last N experts
             # split the router logits into shared and unshared experts
             router_logits_standard = router_logits[
                 :, : -self.num_shared_experts
@@ -297,9 +336,9 @@ class FlexOlmoNoQKNormPrenormSparseMoeBlock(nn.Module):
             routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
 
         if self.norm_topk_prob:
-            if self.num_shared_experts > 0:
+            if self.num_shared_experts > 0 or (self.always_active_experts is not None and len(self.always_active_experts) > 0):
                 raise NotImplementedError(
-                    "norm_topk_prob is not implemented for the case where num_shared_experts > 0, but should be a simple change"
+                    "norm_topk_prob is not implemented for the case where num_shared_experts > 0 or always_active_experts is set"
                 )
             routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
 
@@ -334,7 +373,8 @@ class FlexOlmoNoQKNormPrenormSparseMoeBlock(nn.Module):
 
 class FlexOlmoNoQKNormPrenormDecoderLayer(GradientCheckpointingLayer):
     def __init__(
-        self, config: FlexOlmoNoQKNormPrenormConfig, layer_idx: int, num_experts: int, num_shared_experts: int
+        self, config: FlexOlmoNoQKNormPrenormConfig, layer_idx: int, num_experts: int, num_shared_experts: int,
+        always_active_experts: Optional[list[int]] = None,
     ):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -357,7 +397,7 @@ class FlexOlmoNoQKNormPrenormDecoderLayer(GradientCheckpointingLayer):
             dense_config.dense_mlp_bias = getattr(config, "dense_mlp_bias", False)
             self.mlp = FlexOlmoNoQKNormPrenormMLP(dense_config)
         else:
-            self.mlp = FlexOlmoNoQKNormPrenormSparseMoeBlock(config, num_experts, num_shared_experts)
+            self.mlp = FlexOlmoNoQKNormPrenormSparseMoeBlock(config, num_experts, num_shared_experts, always_active_experts)
 
         self.pre_attention_layernorm = FlexOlmoNoQKNormPrenormRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.pre_feedforward_layernorm = FlexOlmoNoQKNormPrenormRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -496,6 +536,12 @@ class FlexOlmoNoQKNormPrenormModel(FlexOlmoNoQKNormPrenormPreTrainedModel):
         # Check if per-layer expert counts are specified
         num_experts_per_layer = getattr(config, "num_experts_per_layer", None)
         num_shared_experts_per_layer = getattr(config, "num_shared_experts_per_layer", None)
+        always_active_experts_per_layer = getattr(config, "always_active_experts_per_layer", None)
+        always_active_experts = getattr(config, "always_active_experts", None)
+
+        # Resolve always_active_experts to a per-layer list
+        if always_active_experts_per_layer is None and always_active_experts is not None:
+            always_active_experts_per_layer = [always_active_experts] * config.num_hidden_layers
 
         if num_experts_per_layer is not None:
             # Use per-layer expert counts
@@ -510,7 +556,8 @@ class FlexOlmoNoQKNormPrenormModel(FlexOlmoNoQKNormPrenormPreTrainedModel):
             self.layers = nn.ModuleList(
                 [
                     FlexOlmoNoQKNormPrenormDecoderLayer(
-                        config, layer_idx, num_experts_per_layer[layer_idx], num_shared_experts_per_layer[layer_idx]
+                        config, layer_idx, num_experts_per_layer[layer_idx], num_shared_experts_per_layer[layer_idx],
+                        always_active_experts=always_active_experts_per_layer[layer_idx] if always_active_experts_per_layer is not None else None,
                     )
                     for layer_idx in range(config.num_hidden_layers)
                 ]
@@ -520,7 +567,8 @@ class FlexOlmoNoQKNormPrenormModel(FlexOlmoNoQKNormPrenormPreTrainedModel):
             self.layers = nn.ModuleList(
                 [
                     FlexOlmoNoQKNormPrenormDecoderLayer(
-                        config, layer_idx, config.num_experts, config.num_shared_experts
+                        config, layer_idx, config.num_experts, config.num_shared_experts,
+                        always_active_experts=always_active_experts_per_layer[layer_idx] if always_active_experts_per_layer is not None else None,
                     )
                     for layer_idx in range(config.num_hidden_layers)
                 ]
@@ -656,6 +704,8 @@ def load_balancing_loss_func_olmoe(
     num_shared_experts=0,
     num_experts_per_layer: Optional[list[int]] = None,
     num_shared_experts_per_layer: Optional[list[int]] = None,
+    always_active_experts: Optional[list[int]] = None,
+    always_active_experts_per_layer: Optional[list[list[int]]] = None,
 ) -> Union[torch.Tensor, int]:
     r"""
     Computes auxiliary load balancing loss as in Switch Transformer - implemented in Pytorch.
@@ -694,6 +744,10 @@ def load_balancing_loss_func_olmoe(
     compute_device = gate_logits[0].device
     num_hidden_layers = len(gate_logits)
 
+    # Resolve always_active_experts for the uniform path
+    if always_active_experts_per_layer is None and always_active_experts is not None:
+        always_active_experts_per_layer = [always_active_experts] * num_hidden_layers
+
     # Check if we have variable expert counts
     has_variable_experts = num_experts_per_layer is not None and len(set(num_experts_per_layer)) > 1
 
@@ -711,6 +765,16 @@ def load_balancing_loss_func_olmoe(
             top_k = top_k - num_shared_experts
 
         routing_weights = torch.nn.functional.softmax(concatenated_gate_logits, dim=-1)
+
+        # Exclude always-active experts from the LB loss: zero out their columns
+        # so they don't contribute to the dot product, and adjust num_experts/top_k.
+        # Since columns are zeroed, topk will also naturally skip them.
+        if always_active_experts_per_layer is not None and len(always_active_experts_per_layer[0]) > 0:
+            aa_experts = always_active_experts_per_layer[0]  # uniform across layers in this path
+            routing_weights = routing_weights.clone()
+            routing_weights[:, :, aa_experts] = 0.0
+            num_experts = num_experts - len(aa_experts)
+            top_k = top_k - len(aa_experts)
 
         _, selected_experts = torch.topk(
             routing_weights, top_k, dim=-1
@@ -824,6 +888,14 @@ def load_balancing_loss_func_olmoe(
 
             # Compute routing weights
             routing_weights = torch.nn.functional.softmax(layer_gate, dim=-1)
+
+            # Exclude always-active experts from the LB loss
+            layer_aa = always_active_experts_per_layer[layer_idx] if always_active_experts_per_layer is not None else None
+            if layer_aa is not None and len(layer_aa) > 0:
+                routing_weights = routing_weights.clone()
+                routing_weights[:, layer_aa] = 0.0
+                effective_num_experts = effective_num_experts - len(layer_aa)
+                effective_top_k = effective_top_k - len(layer_aa)
 
             _, selected_experts = torch.topk(
                 routing_weights, effective_top_k, dim=-1
@@ -973,6 +1045,13 @@ class FlexOlmoNoQKNormPrenormForCausalLM(FlexOlmoNoQKNormPrenormPreTrainedModel,
                 if num_shared_experts_per_layer is not None:
                     num_shared_experts_per_layer = [num_shared_experts_per_layer[i] for i in moe_mask]
 
+            # Resolve always_active_experts for LB loss
+            always_active_experts_per_layer_for_loss = getattr(self.config, "always_active_experts_per_layer", None)
+            always_active_experts_for_loss = getattr(self.config, "always_active_experts", None)
+            # Filter out dense layers if needed
+            if num_experts_per_layer is not None and always_active_experts_per_layer_for_loss is not None:
+                always_active_experts_per_layer_for_loss = [always_active_experts_per_layer_for_loss[i] for i in moe_mask]
+
             lb_loss = load_balancing_loss_func_olmoe(
                 outputs.router_logits if return_dict else outputs[-1],
                 self.num_experts,
@@ -982,6 +1061,8 @@ class FlexOlmoNoQKNormPrenormForCausalLM(FlexOlmoNoQKNormPrenormPreTrainedModel,
                 num_shared_experts=self.config.num_shared_experts,
                 num_experts_per_layer=num_experts_per_layer,
                 num_shared_experts_per_layer=num_shared_experts_per_layer,
+                always_active_experts=always_active_experts_for_loss,
+                always_active_experts_per_layer=always_active_experts_per_layer_for_loss,
                 **kwargs,
             )
             if labels is not None:
