@@ -766,13 +766,13 @@ def load_balancing_loss_func_olmoe(
 
         routing_weights = torch.nn.functional.softmax(concatenated_gate_logits, dim=-1)
 
-        # Exclude always-active experts from the LB loss: zero out their columns
-        # so they don't contribute to the dot product, and adjust num_experts/top_k.
-        # Since columns are zeroed, topk will also naturally skip them.
+        # Exclude always-active experts from the LB loss by removing their
+        # columns entirely so that num_experts matches the last dimension.
         if always_active_experts_per_layer is not None and len(always_active_experts_per_layer[0]) > 0:
             aa_experts = always_active_experts_per_layer[0]  # uniform across layers in this path
-            routing_weights = routing_weights.clone()
-            routing_weights[:, :, aa_experts] = 0.0
+            routed_mask = torch.ones(num_experts, dtype=torch.bool, device=compute_device)
+            routed_mask[aa_experts] = False
+            routing_weights = routing_weights[:, :, routed_mask]
             num_experts = num_experts - len(aa_experts)
             top_k = top_k - len(aa_experts)
 
@@ -889,11 +889,12 @@ def load_balancing_loss_func_olmoe(
             # Compute routing weights
             routing_weights = torch.nn.functional.softmax(layer_gate, dim=-1)
 
-            # Exclude always-active experts from the LB loss
+            # Exclude always-active experts from the LB loss by removing their columns
             layer_aa = always_active_experts_per_layer[layer_idx] if always_active_experts_per_layer is not None else None
             if layer_aa is not None and len(layer_aa) > 0:
-                routing_weights = routing_weights.clone()
-                routing_weights[:, layer_aa] = 0.0
+                routed_mask = torch.ones(effective_num_experts, dtype=torch.bool, device=compute_device)
+                routed_mask[layer_aa] = False
+                routing_weights = routing_weights[:, routed_mask]
                 effective_num_experts = effective_num_experts - len(layer_aa)
                 effective_top_k = effective_top_k - len(layer_aa)
 
